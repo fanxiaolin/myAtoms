@@ -1,6 +1,11 @@
 server:
   port: 8080
 
+spring:
+  mvc:
+    async:
+      request-timeout: 5m
+
 llm:
   base-url: https://api.siliconflow.cn
   model: Pro/zai-org/GLM-5.1

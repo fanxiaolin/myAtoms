@@ -50,6 +50,25 @@ curl --request POST \
   }'
 ```
 
+### 流式输出
+
+需要实时接收思考过程和最终 HTML 时，调用 SSE 接口：
+
+```bash
+curl -N --request POST \
+  --url http://localhost:8080/api/chat/completions/stream \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [
+      {"role": "user", "content": "生成一个登录页面，只返回完整 HTML"}
+    ]
+  }'
+```
+
+接口会强制启用流式输出和思考模式，并原样转发 SiliconFlow SSE。前端分别读取
+`choices[0].delta.reasoning_content`（思考过程）与
+`choices[0].delta.content`（最终 HTML）；流以 `data: [DONE]` 结束。
+
 ## 验证
 
 ```bash

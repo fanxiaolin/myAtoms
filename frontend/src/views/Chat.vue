@@ -1,6 +1,12 @@
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { marked } from 'marked'
+
+marked.setOptions({
+  breaks: true,
+  gfm: true
+})
 
 const route = useRoute()
 const router = useRouter()
@@ -10,6 +16,97 @@ const messages = ref([])
 const isLoading = ref(false)
 const activeTab = ref('discover')
 const thinkingSteps = ref([])
+const isThinking = ref(false)
+
+const generatedCode = ref('')
+const previewContent = ref('')
+const isPreviewLoading = ref(false)
+const rightPanelRef = ref(null)
+const previewHeightPercent = ref(35)
+const isResizingPreview = ref(false)
+let resizeHandle = null
+let resizePointerId = null
+let resizeAnimationFrame = null
+let pendingResizePercent = null
+
+const resizePreview = (event) => {
+  if (!isResizingPreview.value || !rightPanelRef.value) return
+
+  const rect = rightPanelRef.value.getBoundingClientRect()
+  const nextPercent = ((event.clientY - rect.top) / rect.height) * 100
+  const clampedPercent = Math.min(75, Math.max(20, nextPercent))
+  pendingResizePercent = clampedPercent
+
+  if (resizeAnimationFrame) cancelAnimationFrame(resizeAnimationFrame)
+  resizeAnimationFrame = requestAnimationFrame(() => {
+    previewHeightPercent.value = clampedPercent
+    resizeAnimationFrame = null
+  })
+}
+
+const stopPreviewResize = () => {
+  if (!isResizingPreview.value) return
+  isResizingPreview.value = false
+  if (resizeAnimationFrame) {
+    cancelAnimationFrame(resizeAnimationFrame)
+    resizeAnimationFrame = null
+  }
+  if (pendingResizePercent !== null) {
+    previewHeightPercent.value = pendingResizePercent
+    pendingResizePercent = null
+  }
+  if (resizeHandle && resizePointerId !== null && resizeHandle.hasPointerCapture(resizePointerId)) {
+    resizeHandle.releasePointerCapture(resizePointerId)
+  }
+  resizeHandle = null
+  resizePointerId = null
+  document.body.style.removeProperty('cursor')
+  document.body.style.removeProperty('user-select')
+  window.removeEventListener('pointermove', resizePreview)
+  window.removeEventListener('pointerup', stopPreviewResize)
+  window.removeEventListener('pointercancel', stopPreviewResize)
+}
+
+const startPreviewResize = (event) => {
+  event.preventDefault()
+  resizeHandle = event.currentTarget
+  resizePointerId = event.pointerId
+  resizeHandle.setPointerCapture(resizePointerId)
+  isResizingPreview.value = true
+  document.body.style.cursor = 'row-resize'
+  document.body.style.userSelect = 'none'
+  window.addEventListener('pointermove', resizePreview)
+  window.addEventListener('pointerup', stopPreviewResize)
+  window.addEventListener('pointercancel', stopPreviewResize)
+}
+
+const copyCode = async () => {
+  if (generatedCode.value) {
+    await navigator.clipboard.writeText(generatedCode.value)
+    showToast('代码已复制')
+  }
+}
+
+const decodeHTML = (html) => {
+  const textarea = document.createElement('textarea')
+  textarea.innerHTML = html
+  return textarea.value
+}
+
+const escapeHTML = (str) => {
+  return str.replace(/[&<>"']/g, char => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  }[char]))
+}
+
+const renderMessage = (content) => {
+  const escaped = escapeHTML(content)
+  return escaped.replace(/```(?:\w+)?\s*\n?([\s\S]*?)```/g, '<pre><code>$1</code></pre>')
+}
 
 const showMenu = ref(false)
 const menuPosition = ref({ left: '0px', bottom: '0px' })
@@ -26,12 +123,10 @@ const navItems = [
 const API_URL = '/api/chat/completions'
 
 const scrollToBottom = () => {
-  setTimeout(() => {
-    const container = document.querySelector('.chat-container')
-    if (container) {
-      container.scrollTop = container.scrollHeight
-    }
-  }, 100)
+  const container = document.querySelector('.chat-container')
+  if (container) {
+    container.scrollTop = container.scrollHeight
+  }
 }
 
 const toggleMenu = (e) => {
@@ -96,6 +191,7 @@ const showToast = (message) => {
 
 const simulateThinking = async () => {
   thinkingSteps.value = []
+  isThinking.value = true
   const steps = [
     'I\'m getting started.',
     'This is a casual chat question asking for travel recommendations. I\'ll respond directly with helpful suggestions.',
@@ -111,17 +207,20 @@ const simulateThinking = async () => {
 
 const callChatAPI = async (userMessage) => {
   try {
-    const response = await fetch(API_URL, {
+    const STREAM_URL = '/api/chat/completions/stream'
+    const response = await fetch(STREAM_URL, {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        'Accept': 'text/event-stream'
       },
       body: JSON.stringify({
         messages: [
           { role: 'system', content: '你是一个有用的助手x' },
-          ...messages.value,
+          ...messages.value.filter(msg => msg.role !== 'thinking'),
           { role: 'user', content: userMessage }
-        ]
+        ],
+        stream: true
       })
     })
 
@@ -129,17 +228,188 @@ const callChatAPI = async (userMessage) => {
       throw new Error(`HTTP error! status: ${response.status}`)
     }
 
-    const data = await response.json()
-    
-    if (data.choices && data.choices.length > 0) {
-      return data.choices[0].message.content
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder('utf-8')
+    let fullContent = ''
+    let displayContent = ''
+    let lastScrollTime = 0
+    let assistantIndex = null
+    let sseBuffer = ''
+    let streamFinished = false
+
+    const applyDelta = (content) => {
+      isThinking.value = false
+      if (assistantIndex === null) {
+        assistantIndex = messages.value.push({
+          role: 'assistant',
+          content: '',
+          time: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+        }) - 1
+      }
+
+      fullContent += content
+      // 始终根据完整内容重新渲染，避免 ``` 或 HTML 标签被拆在两个网络分片中。
+      displayContent = renderMessage(fullContent)
+      messages.value[assistantIndex].content = displayContent
+
+      const streamingCode = extractStreamingHTML(fullContent)
+      if (streamingCode) {
+        isPreviewLoading.value = true
+        generatedCode.value = streamingCode
+      }
+
+      const now = Date.now()
+      if (now - lastScrollTime > 100) {
+        scrollToBottom()
+        lastScrollTime = now
+      }
     }
+
+    const processSSEEvent = (event) => {
+      const dataStr = event
+        .split('\n')
+        .filter(line => line.startsWith('data:'))
+        .map(line => line.slice(5).replace(/^ /, ''))
+        .join('\n')
+
+      if (!dataStr) return false
+      if (dataStr.trim() === '[DONE]') return true
+
+      try {
+        const data = JSON.parse(dataStr)
+        const choice = data.choices?.[0]
+        const content = choice?.delta?.content
+        if (typeof content === 'string' && content.length > 0) {
+          applyDelta(content)
+        }
+        return choice?.finish_reason === 'stop'
+      } catch (error) {
+        // 此处拿到的一定是由空行终止的完整 SSE 事件；解析失败才是真正的服务端数据问题。
+        console.warn('Invalid SSE event:', dataStr, error)
+        return false
+      }
+    }
+
+    while (!streamFinished) {
+      const { done, value } = await reader.read()
+      sseBuffer += decoder.decode(value || new Uint8Array(), { stream: !done })
+      // 同时兼容服务端的 CRLF 和 LF；未结束的事件继续留在缓冲区等待下次 read()。
+      sseBuffer = sseBuffer.replace(/\r\n/g, '\n')
+
+      let eventEnd = sseBuffer.indexOf('\n\n')
+      while (eventEnd !== -1) {
+        const event = sseBuffer.slice(0, eventEnd)
+        sseBuffer = sseBuffer.slice(eventEnd + 2)
+        streamFinished = processSSEEvent(event)
+        if (streamFinished) break
+        eventEnd = sseBuffer.indexOf('\n\n')
+      }
+
+      if (done) {
+        if (!streamFinished && sseBuffer.trim()) {
+          streamFinished = processSSEEvent(sseBuffer.trim())
+        }
+        break
+      }
+    }
+
+    reader.releaseLock()
+    isPreviewLoading.value = false
+    processCodeAndPreview(fullContent)
     
-    return '抱歉，我无法理解您的请求。'
+    return fullContent
   } catch (error) {
     console.error('Chat API error:', error)
+    isPreviewLoading.value = false
     return '抱歉，服务暂时不可用，请稍后再试。'
   }
+}
+
+const extractStreamingHTML = (content) => {
+  const fencedStart = content.match(/```(?:html)?\s*\n?/i)
+  if (fencedStart?.index !== undefined) {
+    const start = fencedStart.index + fencedStart[0].length
+    const remainder = content.slice(start)
+    const closingFence = remainder.indexOf('```')
+    return closingFence === -1 ? remainder : remainder.slice(0, closingFence)
+  }
+
+  const htmlStart = content.search(/<!doctype\s+html|<html\b/i)
+  return htmlStart === -1 ? '' : content.slice(htmlStart)
+}
+
+const extractHTMLCode = (code) => {
+  const htmlMatch = code.match(/<!DOCTYPE[\s\S]*<\/html>/) || code.match(/<html[\s\S]*<\/html>/)
+  if (htmlMatch) {
+    return htmlMatch[0]
+  }
+  
+  const bodyMatch = code.match(/<body([^>]*)>([\s\S]*?)<\/body>/gi)
+  if (bodyMatch && bodyMatch.length > 0) {
+    return bodyMatch[bodyMatch.length - 1]
+  }
+  
+  return code
+}
+
+const processCodeAndPreview = (content) => {
+  if (generatedCode.value) {
+    const htmlCode = extractHTMLCode(generatedCode.value)
+    generatedCode.value = htmlCode
+    
+    let previewHTML = htmlCode.trim()
+    
+    if (!previewHTML.startsWith('<!DOCTYPE') && !previewHTML.startsWith('<html')) {
+      const bodyMatch = previewHTML.match(/<body([^>]*)>([\s\S]*?)<\/body>/i)
+      if (bodyMatch) {
+        previewHTML = `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head><body${bodyMatch[1]}>${bodyMatch[2]}</body></html>`
+      } else {
+        previewHTML = `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head><body>${previewHTML}</body></html>`
+      }
+    }
+    
+    previewContent.value = previewHTML
+    return
+  }
+  
+  const codeBlockMatch = content.match(/```html\s*([\s\S]*?)\s*```/) || content.match(/```\s*([\s\S]*?)\s*```/)
+  
+  if (codeBlockMatch) {
+    const rawCode = codeBlockMatch[1]
+    const htmlCode = extractHTMLCode(rawCode)
+    generatedCode.value = htmlCode
+    
+    let previewHTML = htmlCode.trim()
+    
+    if (!previewHTML.startsWith('<!DOCTYPE') && !previewHTML.startsWith('<html')) {
+      const bodyMatch = previewHTML.match(/<body([^>]*)>([\s\S]*?)<\/body>/i)
+      if (bodyMatch) {
+        previewHTML = `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head><body${bodyMatch[1]}>${bodyMatch[2]}</body></html>`
+      } else {
+        previewHTML = `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head><body>${previewHTML}</body></html>`
+      }
+    }
+    
+    previewContent.value = previewHTML
+    return
+  }
+  
+  const htmlTagMatch = content.match(/<html[\s\S]*<\/html>/)
+  if (htmlTagMatch) {
+    generatedCode.value = htmlTagMatch[0]
+    previewContent.value = htmlTagMatch[0]
+    return
+  }
+  
+  const bodyTagMatch = content.match(/<body[\s\S]*<\/body>/)
+  if (bodyTagMatch) {
+    generatedCode.value = bodyTagMatch[0]
+    previewContent.value = `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>${bodyTagMatch[0]}</html>`
+    return
+  }
+  
+  generatedCode.value = ''
+  previewContent.value = ''
 }
 
 const handleEnter = (e) => {
@@ -175,13 +445,7 @@ const sendMessage = async () => {
   
   thinkingSteps.value = []
   
-  const responseContent = await callChatAPI(userContent)
-  
-  messages.value.push({
-    role: 'assistant',
-    content: responseContent,
-    time: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
-  })
+  await callChatAPI(userContent)
   
   isLoading.value = false
   scrollToBottom()
@@ -222,19 +486,15 @@ onMounted(async () => {
   
   thinkingSteps.value = []
   
-  const responseContent = await callChatAPI(initialMessage)
+  await callChatAPI(initialMessage)
   
-  messages.value.push({
-    role: 'assistant',
-    content: responseContent,
-    time: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
-  })
   isLoading.value = false
   scrollToBottom()
 })
 
 onUnmounted(() => {
   document.removeEventListener('click', closeMenu)
+  stopPreviewResize()
 })
 </script>
 
@@ -260,149 +520,194 @@ onUnmounted(() => {
     </header>
 
     <main class="main">
-      <div class="chat-container">
-        <div 
-          v-for="(message, index) in messages" 
-          :key="index" 
-          :class="['message', message.role]"
-        >
-          <template v-if="message.role === 'thinking'">
-            <div class="thinking-avatar">🤖</div>
-            <div class="thinking-content">
-              <div class="thinking-header">
-                <span class="thinking-name">Alex</span>
-                <span class="thinking-tag">工程师</span>
-              </div>
-              <div class="thinking-steps">
-                <div class="steps-summary">
-                  <span class="check-icon">✓</span>
-                  <span>已处理 {{ message.steps.length }} 步</span>
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <polyline points="6 9 12 15 18 9"></polyline>
-                  </svg>
+      <div class="left-panel">
+        <div class="chat-container">
+          <div 
+            v-for="(message, index) in messages" 
+            :key="index" 
+            :class="['message', message.role]"
+          >
+            <template v-if="message.role === 'thinking'">
+              <div class="thinking-avatar">🤖</div>
+              <div class="thinking-content">
+                <div class="thinking-header">
+                  <span class="thinking-name">Alex</span>
+                  <span class="thinking-tag">工程师</span>
                 </div>
-                <div class="steps-list">
-                  <div v-for="(step, idx) in message.steps" :key="idx" class="step-item">
-                    <span class="step-dot"></span>
-                    <span class="step-text">{{ step }}</span>
+                <div class="thinking-steps">
+                  <div class="steps-summary">
+                    <span class="check-icon">✓</span>
+                    <span>已处理 {{ message.steps.length }} 步</span>
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <polyline points="6 9 12 15 18 9"></polyline>
+                    </svg>
+                  </div>
+                  <div class="steps-list">
+                    <div v-for="(step, idx) in message.steps" :key="idx" class="step-item">
+                      <span class="step-dot"></span>
+                      <span class="step-text">{{ step }}</span>
+                    </div>
+                  </div>
+                  <div v-if="isThinking" class="thinking-dots">
+                    <span class="dot"></span>
+                    <span class="dot"></span>
+                    <span class="dot"></span>
                   </div>
                 </div>
               </div>
-            </div>
-          </template>
-          <template v-else>
-            <div class="message-avatar">
-              <span v-if="message.role === 'user'">👤</span>
-              <span v-else>🤖</span>
-            </div>
-            <div class="message-content">
-              <div class="message-header">
-                <span class="message-name">{{ message.role === 'user' ? '我' : 'Alex' }}</span>
-                <span v-if="message.role === 'assistant'" class="processing-tag">工程师</span>
-                <span class="message-time">{{ message.time }}</span>
+            </template>
+            <template v-else>
+              <div class="message-avatar">
+                <span v-if="message.role === 'user'">👤</span>
+                <span v-else>🤖</span>
               </div>
-              <div class="message-text">{{ message.content }}</div>
-            </div>
-          </template>
+              <div class="message-content">
+                <div class="message-header">
+                  <span class="message-name">{{ message.role === 'user' ? '我' : 'Alex' }}</span>
+                  <span v-if="message.role === 'assistant'" class="processing-tag">工程师</span>
+                  <span class="message-time">{{ message.time }}</span>
+                </div>
+                <div class="message-text" v-html="message.content"></div>
+              </div>
+            </template>
+          </div>
         </div>
-        
-        <div v-if="isLoading" class="thinking-message">
-          <div class="thinking-avatar">🤖</div>
-          <div class="thinking-content">
-            <div class="thinking-header">
-              <span class="thinking-name">Alex</span>
-              <span class="thinking-tag">工程师</span>
-            </div>
-            <div class="thinking-steps">
-              <div class="steps-summary">
-                <span class="check-icon">✓</span>
-                <span>已处理 {{ thinkingSteps.length }} 步</span>
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <polyline points="6 9 12 15 18 9"></polyline>
-                </svg>
+
+        <div class="chat-input-area">
+          <textarea 
+            v-model="chatInput" 
+            class="chat-input" 
+            placeholder="让智能团队实现你的想法"
+            rows="2"
+            @keydown.enter="handleEnter"
+          ></textarea>
+          <div class="input-actions">
+            <button ref="menuBtnRef" class="action-btn menu-toggle-btn" @click="toggleMenu">
+              <svg v-if="!showMenu" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="12" y1="5" x2="12" y2="19"></line>
+                <line x1="5" y1="12" x2="19" y2="12"></line>
+              </svg>
+              <svg v-else width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="18" y1="6" x2="6" y2="18"></line>
+                <line x1="6" y1="6" x2="18" y2="18"></line>
+              </svg>
+            </button>
+            
+            <div v-if="showMenu" class="dropdown-menu" :style="menuPosition" @click.stop>
+              <div class="menu-item" @click="teamMode = !teamMode">
+                <span class="menu-icon">👥</span>
+                <span class="menu-text">团队模式</span>
+                <span :class="['menu-toggle', { off: !teamMode }]"></span>
               </div>
-              <div class="steps-list">
-                <div v-for="(step, idx) in thinkingSteps" :key="idx" class="step-item">
-                  <span class="step-dot"></span>
-                  <span class="step-text">{{ step }}</span>
+              <div class="menu-item has-submenu" @click.stop>
+                <span class="menu-icon">📎</span>
+                <span class="menu-text">附件</span>
+                <span class="menu-arrow">›</span>
+                
+                <div class="submenu">
+                  <div class="submenu-item" @click="handleFileUpload('file')">
+                    <span class="submenu-icon">📄</span>
+                    <span class="submenu-text">上传文件</span>
+                  </div>
+                  <div class="submenu-item" @click="handleFileUpload('folder')">
+                    <span class="submenu-icon">📁</span>
+                    <span class="submenu-text">上传文件夹</span>
+                  </div>
                 </div>
               </div>
+              <div class="menu-item has-submenu" @click="showToast('连接器功能开发中')">
+                <span class="menu-icon">🔗</span>
+                <span class="menu-text">连接器</span>
+                <span class="menu-arrow">›</span>
+              </div>
+              <div class="menu-item" @click="showToast('视频功能开发中')">
+                <span class="menu-icon">🎬</span>
+                <span class="menu-text">视频</span>
+                <span class="menu-badge">Seedance 2.0</span>
+                <span class="menu-dot"></span>
+              </div>
+              <div class="menu-item" @click="deepResearch1 = !deepResearch1">
+                <span class="menu-icon">🔍</span>
+                <span class="menu-text">深度研究</span>
+                <span :class="['menu-toggle', { off: !deepResearch1 }]"></span>
+              </div>
+              <div class="menu-item has-submenu" @click="showToast('竞赛模式开发中')">
+                <span class="menu-icon">🏆</span>
+                <span class="menu-text">竞赛模式</span>
+                <span class="menu-arrow">›</span>
+              </div>
             </div>
+
+            <button class="send-btn" @click="sendMessage">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="22" y1="2" x2="11" y2="13"></line>
+                <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+              </svg>
+            </button>
           </div>
         </div>
       </div>
 
-      <div class="chat-input-area">
-        <textarea 
-          v-model="chatInput" 
-          class="chat-input" 
-          placeholder="让智能团队实现你的想法"
-          rows="2"
-          @keydown.enter="handleEnter"
-        ></textarea>
-        <div class="input-actions">
-          <button ref="menuBtnRef" class="action-btn menu-toggle-btn" @click="toggleMenu">
-            <svg v-if="!showMenu" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <line x1="12" y1="5" x2="12" y2="19"></line>
-              <line x1="5" y1="12" x2="19" y2="12"></line>
-            </svg>
-            <svg v-else width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <line x1="18" y1="6" x2="6" y2="18"></line>
-              <line x1="6" y1="6" x2="18" y2="18"></line>
-            </svg>
-          </button>
-          
-          <div v-if="showMenu" class="dropdown-menu" :style="menuPosition" @click.stop>
-            <div class="menu-item" @click="teamMode = !teamMode">
-              <span class="menu-icon">👥</span>
-              <span class="menu-text">团队模式</span>
-              <span :class="['menu-toggle', { off: !teamMode }]"></span>
+      <div
+        ref="rightPanelRef"
+        class="right-panel"
+        :class="{ resizing: isResizingPreview }"
+        :style="{ gridTemplateRows: `${previewHeightPercent}% 10px minmax(0, 1fr)` }"
+      >
+        <div class="preview-panel">
+          <div class="panel-header">
+            <span class="panel-title">预览</span>
+            <span class="panel-status">{{ previewContent ? '已生成' : '等待中' }}</span>
+          </div>
+          <div class="panel-content">
+            <div v-if="isPreviewLoading" class="preview-loading">
+              <div class="spinner"></div>
+              <p class="loading-text">代码生成中...</p>
             </div>
-            <div class="menu-item has-submenu" @click.stop>
-              <span class="menu-icon">📎</span>
-              <span class="menu-text">附件</span>
-              <span class="menu-arrow">›</span>
-              
-              <div class="submenu">
-                <div class="submenu-item" @click="handleFileUpload('file')">
-                  <span class="submenu-icon">📄</span>
-                  <span class="submenu-text">上传文件</span>
-                </div>
-                <div class="submenu-item" @click="handleFileUpload('folder')">
-                  <span class="submenu-icon">📁</span>
-                  <span class="submenu-text">上传文件夹</span>
-                </div>
-              </div>
-            </div>
-            <div class="menu-item has-submenu" @click="showToast('连接器功能开发中')">
-              <span class="menu-icon">🔗</span>
-              <span class="menu-text">连接器</span>
-              <span class="menu-arrow">›</span>
-            </div>
-            <div class="menu-item" @click="showToast('视频功能开发中')">
-              <span class="menu-icon">🎬</span>
-              <span class="menu-text">视频</span>
-              <span class="menu-badge">Seedance 2.0</span>
-              <span class="menu-dot"></span>
-            </div>
-            <div class="menu-item" @click="deepResearch1 = !deepResearch1">
-              <span class="menu-icon">🔍</span>
-              <span class="menu-text">深度研究</span>
-              <span :class="['menu-toggle', { off: !deepResearch1 }]"></span>
-            </div>
-            <div class="menu-item has-submenu" @click="showToast('竞赛模式开发中')">
-              <span class="menu-icon">🏆</span>
-              <span class="menu-text">竞赛模式</span>
-              <span class="menu-arrow">›</span>
+            <iframe v-else-if="previewContent" class="preview-iframe" :srcdoc="previewContent"></iframe>
+            <div v-else class="preview-placeholder">
+              <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" class="preview-icon">
+                <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
+                <line x1="8" y1="21" x2="16" y2="21"></line>
+                <line x1="12" y1="17" x2="12" y2="21"></line>
+              </svg>
+              <p class="preview-text">Web 应用预览将在此显示</p>
+              <p class="preview-hint">点击发送消息开始构建应用</p>
             </div>
           </div>
+        </div>
 
-          <button class="send-btn" @click="sendMessage">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <line x1="22" y1="2" x2="11" y2="13"></line>
-              <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
-            </svg>
-          </button>
+        <div
+          class="panel-resizer"
+          :class="{ active: isResizingPreview }"
+          role="separator"
+          aria-label="调整预览区和代码区高度"
+          aria-orientation="horizontal"
+          :aria-valuenow="Math.round(previewHeightPercent)"
+          @pointerdown="startPreviewResize"
+        >
+          <span class="resizer-handle"></span>
+        </div>
+
+        <div class="code-panel">
+          <div class="panel-header">
+            <span class="panel-title">代码</span>
+            <div class="panel-actions">
+              <button class="copy-btn" @click="copyCode">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                </svg>
+                <span>复制</span>
+              </button>
+            </div>
+          </div>
+          <div class="panel-content code-content">
+            <pre v-if="generatedCode" class="code-block"><code class="code-text">{{ generatedCode }}</code></pre>
+            <pre v-else class="code-block"><code class="code-text">// 生成的代码将在此显示
+
+发送消息开始生成作品代码...</code></pre>
+          </div>
         </div>
       </div>
     </main>
@@ -493,21 +798,286 @@ onUnmounted(() => {
 
 .main {
   width: 100%;
-  padding: 100px 3vw 0;
+  padding: 88px 24px 24px;
   box-sizing: border-box;
   background: #f5f5f5;
   height: 100vh;
+  display: grid;
+  grid-template-columns: minmax(320px, 0.72fr) minmax(0, 1.28fr);
+  gap: 20px;
+}
+
+.left-panel {
+  min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
+  gap: 16px;
+  overflow: hidden;
+}
+
+.right-panel {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  gap: 0;
+  overflow: hidden;
+}
+
+@media (max-width: 768px) {
+  .main {
+    display: block;
+    padding: 80px 16px 16px;
+  }
+
+  .right-panel {
+    display: none;
+  }
 }
 
 .chat-container {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
-  padding-right: 1vw;
   display: flex;
   flex-direction: column;
   gap: 20px;
+}
+
+.preview-panel,
+.code-panel {
+  background: #fff;
+  border-radius: 16px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-width: 0;
+  min-height: 0;
+}
+
+.preview-panel {
+  height: 100%;
+}
+
+.panel-resizer {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 10px;
+  cursor: row-resize;
+  touch-action: none;
+  z-index: 2;
+}
+
+.panel-resizer::before {
+  content: '';
+  position: absolute;
+  inset: 3px 0;
+  background: #e2e8f0;
+  transition: background 0.2s;
+}
+
+.resizer-handle {
+  position: relative;
+  width: 52px;
+  height: 4px;
+  border-radius: 999px;
+  background: #94a3b8;
+  transition: width 0.2s, background 0.2s;
+}
+
+.panel-resizer:hover::before,
+.panel-resizer.active::before {
+  background: #bfdbfe;
+}
+
+.panel-resizer:hover .resizer-handle,
+.panel-resizer.active .resizer-handle {
+  width: 68px;
+  background: #3b82f6;
+}
+
+.preview-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: #999;
+}
+
+.spinner {
+  width: 40px;
+  height: 40px;
+  border: 3px solid #f0f0f0;
+  border-top-color: #3b82f6;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.loading-text {
+  margin-top: 12px;
+  font-size: 14px;
+  color: #666;
+}
+
+.code-panel {
+  height: 100%;
+}
+
+.panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 14px 16px;
+  border-bottom: 1px solid #f0f0f0;
+  background: #fafafa;
+}
+
+.panel-title {
+  font-weight: 600;
+  font-size: 14px;
+  color: #333;
+}
+
+.panel-status {
+  font-size: 12px;
+  color: #10b981;
+  background: rgba(16, 185, 129, 0.1);
+  padding: 2px 8px;
+  border-radius: 10px;
+}
+
+.panel-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.copy-btn {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  background: #f0f0f0;
+  border: none;
+  border-radius: 6px;
+  font-size: 12px;
+  color: #666;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.copy-btn:hover {
+  background: #e0e0e0;
+}
+
+.panel-content {
+  flex: 1;
+  min-height: 0;
+  box-sizing: border-box;
+  overflow-y: auto;
+  padding: 16px;
+}
+
+.preview-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: #999;
+}
+
+.preview-content {
+  width: 100%;
+  height: 100%;
+  overflow: auto;
+}
+
+.preview-iframe {
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  border: none;
+  background: white;
+}
+
+.right-panel.resizing .preview-iframe {
+  pointer-events: none;
+}
+
+.preview-icon {
+  color: #cbd5e1;
+  margin-bottom: 12px;
+}
+
+.preview-text {
+  font-size: 14px;
+  color: #666;
+  margin-bottom: 4px;
+}
+
+.preview-hint {
+  font-size: 12px;
+  color: #999;
+}
+
+.code-content {
+  background: #1e293b;
+  padding: 0;
+  min-height: 0;
+  overflow: auto;
+}
+
+.code-block {
+  display: block;
+  margin: 0;
+  padding: 22px 24px;
+  width: 100%;
+  min-width: max-content;
+  min-height: 100%;
+  box-sizing: border-box;
+  background: #1e293b;
+  border-radius: 0;
+  overflow-x: auto;
+  tab-size: 2;
+}
+
+.code-text {
+  display: block;
+  width: max-content;
+  min-width: 100%;
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  font-family: 'Fira Code', 'Monaco', 'Consolas', monospace;
+  font-size: 15px;
+  font-weight: 500;
+  line-height: 1.75;
+  color: #f8fafc;
+  white-space: pre;
+  text-shadow: none;
+}
+
+@media (min-width: 1440px) {
+  .main {
+    padding-left: 32px;
+    padding-right: 32px;
+    grid-template-columns: minmax(360px, 0.68fr) minmax(0, 1.32fr);
+  }
+
+  .code-text {
+    font-size: 16px;
+  }
 }
 
 .message {
@@ -581,6 +1151,32 @@ onUnmounted(() => {
   white-space: pre-wrap;
   box-shadow: 0 1px 3px rgba(0,0,0,0.05);
   max-width: 100%;
+}
+
+.message-text pre {
+  background: #1e293b;
+  color: #e2e8f0;
+  padding: 16px;
+  border-radius: 8px;
+  overflow-x: auto;
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  margin: 12px 0;
+}
+
+.message-text code {
+  background: #f1f5f9;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+  font-size: 13px;
+}
+
+.message-text pre code {
+  background: none;
+  padding: 0;
+  color: inherit;
 }
 
 .message.user .message-text {
@@ -680,10 +1276,47 @@ onUnmounted(() => {
   line-height: 1.5;
 }
 
+.thinking-dots {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 0;
+}
+
+.thinking-dots .dot {
+  width: 8px;
+  height: 8px;
+  background: #3b82f6;
+  border-radius: 50%;
+  animation: thinking-bounce 1.4s infinite ease-in-out both;
+}
+
+.thinking-dots .dot:nth-child(1) {
+  animation-delay: -0.32s;
+}
+
+.thinking-dots .dot:nth-child(2) {
+  animation-delay: -0.16s;
+}
+
+@keyframes thinking-bounce {
+  0%, 80%, 100% {
+    transform: scale(0);
+    opacity: 0.5;
+  }
+  40% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
 .chat-input-area {
   background: #fff;
   border-radius: 16px;
   padding: 16px;
+  width: calc(100% - 52px);
+  margin-left: 52px;
+  box-sizing: border-box;
   box-shadow: 0 4px 20px rgba(0,0,0,0.06);
   border: 1px solid #e5e5e5;
   flex-shrink: 0;

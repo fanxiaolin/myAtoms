@@ -7,6 +7,8 @@ import okhttp3.RequestBody;
 import okhttp3.Response;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.util.concurrent.TimeUnit;
 
 public class LLMutils {
@@ -40,6 +42,18 @@ public class LLMutils {
         }
     }
 
+    public LLMStreamResponse chatCompletionsStream(String requestJson) throws IOException {
+        Request request = new Request.Builder()
+                .url(chatCompletionsUrl)
+                .header("Authorization", "Bearer " + apiKey)
+                .header("Content-Type", "application/json")
+                .header("Accept", "text/event-stream")
+                .post(RequestBody.create(requestJson, JSON))
+                .build();
+
+        return new LLMStreamResponse(client.newCall(request).execute());
+    }
+
     private static String stripTrailingSlash(String value) {
         return value != null && value.endsWith("/")
                 ? value.substring(0, value.length() - 1)
@@ -47,5 +61,44 @@ public class LLMutils {
     }
 
     public record LLMResponse(int statusCode, String body) {
+    }
+
+    public static final class LLMStreamResponse implements AutoCloseable {
+        private static final int BUFFER_SIZE = 1024;
+
+        private final Response response;
+
+        private LLMStreamResponse(Response response) {
+            this.response = response;
+        }
+
+        public int statusCode() {
+            return response.code();
+        }
+
+        public String contentType() {
+            return response.header("Content-Type");
+        }
+
+        public void writeTo(OutputStream outputStream) throws IOException {
+            if (response.body() == null) {
+                close();
+                throw new IOException("SiliconFlow 返回空响应");
+            }
+
+            try (this; InputStream inputStream = response.body().byteStream()) {
+                byte[] buffer = new byte[BUFFER_SIZE];
+                int length;
+                while ((length = inputStream.read(buffer)) != -1) {
+                    outputStream.write(buffer, 0, length);
+                    outputStream.flush();
+                }
+            }
+        }
+
+        @Override
+        public void close() {
+            response.close();
+        }
     }
 }
