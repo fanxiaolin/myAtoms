@@ -2,6 +2,13 @@
 import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 
+import ecommerceImg from '../assets/images/ecommerce.jpg'
+import corporateImg from '../assets/images/corporate.jpg'
+import blogImg from '../assets/images/blog.jpg'
+import adminImg from '../assets/images/admin.jpg'
+import socialImg from '../assets/images/social.jpg'
+import educationImg from '../assets/images/education.jpg'
+
 const router = useRouter()
 const activeTab = ref('discover')
 
@@ -215,37 +222,37 @@ const templates = ref([
   {
     name: '电商平台模板',
     desc: '完整的电商购物流程，支持商品展示、购物车、订单管理',
-    image: '/src/assets/images/ecommerce.jpg',
+    image: ecommerceImg,
     category: '电商'
   },
   {
     name: '企业官网模板',
     desc: '专业的企业展示网站，包含首页、关于我们、产品服务等页面',
-    image: '/src/assets/images/corporate.jpg',
+    image: corporateImg,
     category: '企业'
   },
   {
     name: '博客系统模板',
     desc: '功能完善的博客平台，支持文章发布、评论、分类管理',
-    image: '/src/assets/images/blog.jpg',
+    image: blogImg,
     category: '内容'
   },
   {
     name: '后台管理模板',
     desc: '现代化的管理后台界面，包含数据看板、用户管理、权限控制',
-    image: '/src/assets/images/admin.jpg',
+    image: adminImg,
     category: '管理'
   },
   {
     name: '社交媒体模板',
     desc: '社交网络平台模板，支持用户动态、关注、消息功能',
-    image: '/src/assets/images/social.jpg',
+    image: socialImg,
     category: '社交'
   },
   {
     name: '在线教育模板',
     desc: '在线学习平台模板，包含课程展示、视频播放、学习进度',
-    image: '/src/assets/images/education.jpg',
+    image: educationImg,
     category: '教育'
   }
 ])

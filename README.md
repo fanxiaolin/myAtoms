@@ -15,7 +15,7 @@
 ```bash
 cd backend
 # 需安装 JDK 17+，首次启动需要联网下载 Maven 依赖
-# 编辑 src/main/resources/application.yml，填写有效的 SiliconFlow API Key
+# 编辑 src/main/resources/application.yml，填写有效的 SiliconFlow API Key，测试秘钥暂时没有弄到env环境中
 ./mvnw spring-boot:run
 # 服务地址：http://localhost:8080
 # 接口地址：POST http://localhost:8080/api/
