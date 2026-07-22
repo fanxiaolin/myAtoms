@@ -15,19 +15,17 @@
 
 运行环境：JDK 17 或更高版本。项目已提供 Maven Wrapper，无需单独安装 Maven。
 
-启动前配置 `src/main/resources/application.yml`：
+启动前通过环境变量配置密钥：
 
 ```yaml
 server:
   port: 8080
 
-llm:
-  base-url: https://api.siliconflow.cn
-  model: Pro/zai-org/GLM-5.1
-  api-key: YOUR_API_KEY
+export SILICONFLOW_API_KEY=YOUR_API_KEY
+export TAVILY_API_KEY=YOUR_TAVILY_API_KEY
 ```
 
-将 `YOUR_API_KEY` 替换为有效的 SiliconFlow API Key，然后启动服务：
+然后启动服务：
 
 ```bash
 ./mvnw spring-boot:run

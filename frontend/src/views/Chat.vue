@@ -2,6 +2,8 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { marked } from 'marked'
+import SiteHeader from '../components/SiteHeader.vue'
+import { addPendingFiles, pendingFiles, removePendingFile } from '../stores/attachmentStore'
 
 marked.setOptions({
   breaks: true,
@@ -14,6 +16,7 @@ const router = useRouter()
 const chatInput = ref('')
 const messages = ref([])
 const isLoading = ref(false)
+const activeRequestController = ref(null)
 const activeTab = ref('discover')
 const thinkingSteps = ref([])
 const isThinking = ref(false)
@@ -105,7 +108,10 @@ const escapeHTML = (str) => {
 
 const renderMessage = (content) => {
   const escaped = escapeHTML(content)
-  return escaped.replace(/```(?:\w+)?\s*\n?([\s\S]*?)```/g, '<pre><code>$1</code></pre>')
+  return escaped
+    .replace(/```(?:\w+)?\s*\n?([\s\S]*?)```/g, '<pre><code>$1</code></pre>')
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1 ↗</a>')
+    .replace(/(?<!["'=])(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" rel="noreferrer">$1 ↗</a>')
 }
 
 const showMenu = ref(false)
@@ -113,6 +119,16 @@ const menuPosition = ref({ left: '0px', bottom: '0px' })
 const menuBtnRef = ref(null)
 const teamMode = ref(false)
 const deepResearch1 = ref(false)
+
+const MAX_ATTACHMENT_FILE_BYTES = 512 * 1024
+const MAX_ATTACHMENT_TOTAL_CHARS = 240000
+const TEXT_FILE_EXTENSIONS = new Set([
+  'txt', 'md', 'markdown', 'json', 'jsonl', 'csv', 'tsv', 'xml', 'yaml', 'yml',
+  'html', 'htm', 'css', 'scss', 'less', 'js', 'jsx', 'ts', 'tsx', 'vue', 'svelte',
+  'java', 'kt', 'kts', 'py', 'rb', 'php', 'go', 'rs', 'c', 'h', 'cpp', 'hpp',
+  'cs', 'swift', 'sql', 'sh', 'bash', 'zsh', 'fish', 'ps1', 'properties', 'toml',
+  'ini', 'conf', 'env', 'gitignore', 'dockerfile', 'gradle', 'graphql', 'gql'
+])
 
 const navItems = [
   { name: 'discover', label: '发现' },
@@ -161,13 +177,54 @@ const handleFileUpload = (type) => {
   input.addEventListener('change', (e) => {
     const files = Array.from(e.target.files)
     if (files.length > 0) {
-      const fileNames = files.map(f => f.name).join(', ')
-      showToast(`已选择 ${files.length} 个文件：${fileNames}`)
+      const { ignored } = addPendingFiles(files)
+      showMenu.value = false
+      showToast(`已加载 ${pendingFiles.value.length} 个附件${ignored ? `，另有 ${ignored} 个超出数量限制` : ''}`)
     }
     e.target.value = ''
   })
   
   input.click()
+}
+
+const isTextAttachment = (file) => {
+  if (file.type.startsWith('text/')) return true
+  const baseName = file.name.toLowerCase()
+  const extension = baseName.includes('.') ? baseName.split('.').pop() : baseName
+  return TEXT_FILE_EXTENSIONS.has(extension)
+}
+
+const prepareAttachments = async (files, signal) => {
+  const attachments = []
+  const skipped = []
+  let totalChars = 0
+
+  for (const item of files) {
+    if (signal.aborted) return { attachments: [], skipped: [] }
+    if (!isTextAttachment(item.file)) {
+      skipped.push(`${item.path}（暂不支持该格式）`)
+      continue
+    }
+    if (item.file.size > MAX_ATTACHMENT_FILE_BYTES) {
+      skipped.push(`${item.path}（超过 512KB）`)
+      continue
+    }
+    let content
+    try {
+      content = await item.file.text()
+    } catch (_) {
+      skipped.push(`${item.path}（读取失败）`)
+      continue
+    }
+    if (totalChars + content.length > MAX_ATTACHMENT_TOTAL_CHARS) {
+      skipped.push(`${item.path}（附件总内容过大）`)
+      continue
+    }
+    totalChars += content.length
+    attachments.push({ name: item.file.name, path: item.path, type: item.file.type, content })
+  }
+
+  return { attachments, skipped }
 }
 
 const showToast = (message) => {
@@ -189,23 +246,35 @@ const showToast = (message) => {
   setTimeout(() => toast.remove(), 2000)
 }
 
-const simulateThinking = async () => {
+const simulateThinking = async (signal) => {
   thinkingSteps.value = []
   isThinking.value = true
-  const steps = [
-    'I\'m getting started.',
-    'This is a casual chat question asking for travel recommendations. I\'ll respond directly with helpful suggestions.',
-    '...'
-  ]
+  const mode = route.query.mode || 'engineer'
+  const steps = mode === 'deep_research'
+    ? ['正在拆解研究问题', '正在检索并交叉验证多个来源', '正在组织结论、争议与引用']
+    : mode === 'team'
+      ? ['正在分析需求与任务范围', '正在选择协作 Agent 与 Skill', '正在生成可执行方案']
+      : ['正在理解任务', '正在规划实现步骤', '正在生成结果']
   
   for (let i = 0; i < steps.length; i++) {
     await new Promise(resolve => setTimeout(resolve, 800))
+    if (signal?.aborted) return false
     thinkingSteps.value.push(steps[i])
     scrollToBottom()
   }
+  return true
 }
 
-const callChatAPI = async (userMessage) => {
+const callChatAPI = async (attachments, controller) => {
+  // 超时按“无数据空闲时间”计算，而不是限制整次生成总时长。
+  // 长 HTML 只要仍在持续流式输出就不会被误杀。
+  let timeout = null
+  const resetIdleTimeout = () => {
+    if (timeout) window.clearTimeout(timeout)
+    timeout = window.setTimeout(() => controller.abort(), 180000)
+  }
+  resetIdleTimeout()
+  let fullContent = ''
   try {
     const STREAM_URL = '/api/chat/completions/stream'
     const response = await fetch(STREAM_URL, {
@@ -217,20 +286,32 @@ const callChatAPI = async (userMessage) => {
       body: JSON.stringify({
         messages: [
           { role: 'system', content: '你是一个有用的助手x' },
-          ...messages.value.filter(msg => msg.role !== 'thinking'),
-          { role: 'user', content: userMessage }
+          ...messages.value
+            .filter(msg => msg.role !== 'thinking')
+            .map(msg => ({ role: msg.role, content: msg.content }))
         ],
-        stream: true
-      })
+        stream: true,
+        mode: route.query.mode || (deepResearch1.value ? 'deep_research' : teamMode.value ? 'team' : 'engineer'),
+        skillIds: route.query.skill ? [route.query.skill] : [],
+        knowledgeIds: [],
+        attachments
+      }),
+      signal: controller.signal
     })
 
     if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`)
+      const raw = await response.text()
+      let detail = raw
+      try {
+        const payload = JSON.parse(raw)
+        detail = payload.detail || payload.message || payload.error?.message || raw
+      } catch (_) { /* 非 JSON 错误体直接展示 */ }
+      if (response.status === 503 && !detail) detail = '后端未配置 SiliconFlow API Key，或模型服务暂时不可用'
+      throw new Error(`${detail || '请求失败'}（HTTP ${response.status}）`)
     }
 
     const reader = response.body.getReader()
     const decoder = new TextDecoder('utf-8')
-    let fullContent = ''
     let displayContent = ''
     let lastScrollTime = 0
     let assistantIndex = null
@@ -292,6 +373,7 @@ const callChatAPI = async (userMessage) => {
 
     while (!streamFinished) {
       const { done, value } = await reader.read()
+      if (value?.length) resetIdleTimeout()
       sseBuffer += decoder.decode(value || new Uint8Array(), { stream: !done })
       // 同时兼容服务端的 CRLF 和 LF；未结束的事件继续留在缓冲区等待下次 read()。
       sseBuffer = sseBuffer.replace(/\r\n/g, '\n')
@@ -321,7 +403,22 @@ const callChatAPI = async (userMessage) => {
   } catch (error) {
     console.error('Chat API error:', error)
     isPreviewLoading.value = false
-    return '抱歉，服务暂时不可用，请稍后再试。'
+    isThinking.value = false
+    if (error?.name === 'AbortError' && controller.userAborted) {
+      if (fullContent) processCodeAndPreview(fullContent)
+      return fullContent
+    }
+    const errorText = error?.name === 'AbortError'
+      ? '请求超时：模型连续 3 分钟没有返回新数据。请检查 SiliconFlow 服务状态和后端日志后重试。'
+      : `请求失败：${error?.message || '服务暂时不可用'}`
+    messages.value.push({ role: 'assistant', content: errorText,
+      time: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) })
+    return errorText
+  } finally {
+    if (timeout) window.clearTimeout(timeout)
+    if (activeRequestController.value === controller) activeRequestController.value = null
+    isThinking.value = false
+    isLoading.value = false
   }
 }
 
@@ -417,25 +514,59 @@ const handleEnter = (e) => {
     return
   }
   e.preventDefault()
+  if (isLoading.value) return
   sendMessage()
 }
 
+const stopGeneration = () => {
+  const controller = activeRequestController.value
+  if (!controller) return
+  controller.userAborted = true
+  controller.abort()
+  isThinking.value = false
+  isPreviewLoading.value = false
+  isLoading.value = false
+  showToast('已停止生成')
+}
+
 const sendMessage = async () => {
-  if (!chatInput.value.trim()) return
+  if (isLoading.value || (!chatInput.value.trim() && pendingFiles.value.length === 0)) return
   
-  const userContent = chatInput.value.trim()
+  const userContent = chatInput.value.trim() || '请分析附件内容，并给出可执行的结论。'
+  const selectedFiles = [...pendingFiles.value]
+  isLoading.value = true
+  const controller = new AbortController()
+  activeRequestController.value = controller
+  const { attachments, skipped } = await prepareAttachments(selectedFiles, controller.signal)
+  if (controller.signal.aborted) {
+    if (activeRequestController.value === controller) activeRequestController.value = null
+    return
+  }
+  if (selectedFiles.length > 0 && attachments.length === 0) {
+    isLoading.value = false
+    activeRequestController.value = null
+    showToast(skipped[0] || '没有可分析的文本文件')
+    return
+  }
   
   messages.value.push({
     role: 'user',
     content: userContent,
+    attachments: attachments.map(item => item.path),
     time: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
   })
   
   chatInput.value = ''
+  pendingFiles.value = []
+  if (skipped.length) showToast(`已跳过 ${skipped.length} 个不支持或过大的文件`)
   scrollToBottom()
-  isLoading.value = true
   
-  await simulateThinking()
+  const thinkingCompleted = await simulateThinking(controller.signal)
+  if (!thinkingCompleted) {
+    if (activeRequestController.value === controller) activeRequestController.value = null
+    thinkingSteps.value = []
+    return
+  }
   
   messages.value.push({
     role: 'thinking',
@@ -445,7 +576,7 @@ const sendMessage = async () => {
   
   thinkingSteps.value = []
   
-  await callChatAPI(userContent)
+  await callChatAPI(attachments, controller)
   
   isLoading.value = false
   scrollToBottom()
@@ -464,35 +595,21 @@ const switchTab = (tab) => {
 
 onMounted(async () => {
   document.addEventListener('click', closeMenu)
+  const initialMessage = route.query.message
+  if (!initialMessage) {
+    if (route.query.skillName) chatInput.value = `请使用「${route.query.skillName}」处理：`
+    return
+  }
   
-  const initialMessage = route.query.message || '请Alex构建一个Web应用。'
-  
-  messages.value.push({
-    role: 'user',
-    content: initialMessage,
-    time: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
-  })
-  
-  scrollToBottom()
-  isLoading.value = true
-  
-  await simulateThinking()
-  
-  messages.value.push({
-    role: 'thinking',
-    steps: [...thinkingSteps.value],
-    time: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
-  })
-  
-  thinkingSteps.value = []
-  
-  await callChatAPI(initialMessage)
-  
-  isLoading.value = false
-  scrollToBottom()
+  chatInput.value = initialMessage
+  await sendMessage()
 })
 
 onUnmounted(() => {
+  if (activeRequestController.value) {
+    activeRequestController.value.userAborted = true
+    activeRequestController.value.abort()
+  }
   document.removeEventListener('click', closeMenu)
   stopPreviewResize()
 })
@@ -500,24 +617,7 @@ onUnmounted(() => {
 
 <template>
   <div class="dashboard">
-    <header class="header">
-      <div class="header-content">
-        <div class="logo" @click="router.push('/')">
-          <span class="logo-icon">⚛</span>
-          <span class="logo-text">Atoms</span>
-        </div>
-        <nav class="nav">
-          <button 
-            v-for="item in navItems" 
-            :key="item.name"
-            :class="['nav-item', { active: activeTab === item.name }]"
-            @click="switchTab(item.name)"
-          >
-            {{ item.label }}
-          </button>
-        </nav>
-      </div>
-    </header>
+    <SiteHeader />
 
     <main class="main">
       <div class="left-panel">
@@ -568,12 +668,22 @@ onUnmounted(() => {
                   <span class="message-time">{{ message.time }}</span>
                 </div>
                 <div class="message-text" v-html="message.content"></div>
+                <div v-if="message.attachments?.length" class="message-attachments">
+                  <span v-for="path in message.attachments" :key="path" class="message-attachment">📄 {{ path }}</span>
+                </div>
               </div>
             </template>
           </div>
         </div>
 
         <div class="chat-input-area">
+          <div v-if="pendingFiles.length" class="pending-attachments">
+            <div v-for="(item, index) in pendingFiles" :key="`${item.path}-${item.file.lastModified}`" class="pending-attachment">
+              <span class="pending-attachment-icon">{{ item.file.type.startsWith('text/') ? '📄' : '📎' }}</span>
+              <span class="pending-attachment-name" :title="item.path">{{ item.path }}</span>
+              <button class="pending-attachment-remove" type="button" :aria-label="`移除 ${item.path}`" @click="removePendingFile(index)">×</button>
+            </div>
+          </div>
           <textarea 
             v-model="chatInput" 
             class="chat-input" 
@@ -638,8 +748,16 @@ onUnmounted(() => {
               </div>
             </div>
 
-            <button class="send-btn" @click="sendMessage">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <button
+              :class="['send-btn', { stop: isLoading }]"
+              :aria-label="isLoading ? '终止生成' : '发送消息'"
+              :title="isLoading ? '终止生成' : '发送消息'"
+              @click="isLoading ? stopGeneration() : sendMessage()"
+            >
+              <svg v-if="isLoading" width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <rect x="7" y="7" width="10" height="10" rx="1"></rect>
+              </svg>
+              <svg v-else width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
                 <line x1="22" y1="2" x2="11" y2="13"></line>
                 <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
               </svg>
@@ -798,10 +916,10 @@ onUnmounted(() => {
 
 .main {
   width: 100%;
-  padding: 88px 24px 24px;
+  padding: 24px;
   box-sizing: border-box;
   background: #f5f5f5;
-  height: 100vh;
+  height: calc(100vh - 64px);
   display: grid;
   grid-template-columns: minmax(320px, 0.72fr) minmax(0, 1.28fr);
   gap: 20px;
@@ -827,7 +945,7 @@ onUnmounted(() => {
 @media (max-width: 768px) {
   .main {
     display: block;
-    padding: 80px 16px 16px;
+    padding: 16px;
   }
 
   .right-panel {
@@ -1322,6 +1440,72 @@ onUnmounted(() => {
   flex-shrink: 0;
 }
 
+.pending-attachments {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 10px;
+  margin-bottom: 10px;
+  border-bottom: 1px solid #eef0f4;
+}
+
+.pending-attachment {
+  max-width: 240px;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 8px;
+  border: 1px solid #dbe3f0;
+  border-radius: 9px;
+  background: #f8fafc;
+  color: #475569;
+  font-size: 12px;
+  flex: 0 0 auto;
+}
+
+.pending-attachment-name {
+  max-width: 174px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pending-attachment-remove {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: #e2e8f0;
+  color: #64748b;
+  cursor: pointer;
+  line-height: 20px;
+}
+
+.pending-attachment-remove:hover {
+  background: #fecaca;
+  color: #b91c1c;
+}
+
+.message-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.message-attachment {
+  max-width: 100%;
+  padding: 5px 8px;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.18);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .chat-input {
   width: 100%;
   border: none;
@@ -1382,6 +1566,15 @@ onUnmounted(() => {
 .send-btn:hover {
   transform: translateY(-2px);
   box-shadow: 0 4px 12px rgba(59, 130, 246, 0.4);
+}
+
+.send-btn.stop {
+  background: #ef4444;
+}
+
+.send-btn.stop:hover {
+  background: #dc2626;
+  box-shadow: 0 4px 12px rgba(239, 68, 68, 0.35);
 }
 
 .dropdown-menu {

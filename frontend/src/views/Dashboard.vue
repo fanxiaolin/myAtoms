@@ -1,6 +1,8 @@
 <script setup>
 import { ref } from 'vue'
 import { useRouter } from 'vue-router'
+import SiteHeader from '../components/SiteHeader.vue'
+import { addPendingFiles, pendingFiles, removePendingFile } from '../stores/attachmentStore'
 
 import ecommerceImg from '../assets/images/ecommerce.jpg'
 import corporateImg from '../assets/images/corporate.jpg'
@@ -81,8 +83,9 @@ const handleFileUpload = (type) => {
   input.addEventListener('change', (e) => {
     const files = Array.from(e.target.files)
     if (files.length > 0) {
-      const fileNames = files.map(f => f.name).join(', ')
-      showToast(`已选择 ${files.length} 个文件：${fileNames}`)
+      const { ignored } = addPendingFiles(files)
+      showMenu.value = false
+      showToast(`已加载 ${pendingFiles.value.length} 个附件${ignored ? `，另有 ${ignored} 个已忽略` : ''}`)
     }
     e.target.value = ''
   })
@@ -118,8 +121,10 @@ const handleEnter = (e) => {
 }
 
 const handleSend = () => {
-  const message = chatInput.value.trim() || '请Alex构建一个Web应用。'
-  router.push({ path: '/chat', query: { message } })
+  const message = chatInput.value.trim()
+    || (pendingFiles.value.length ? '请分析附件内容，并给出可执行的结论。' : '请Alex构建一个Web应用。')
+  const mode = deepResearch1.value ? 'deep_research' : teamMode.value ? 'team' : 'engineer'
+  router.push({ path: '/chat', query: { message, mode } })
 }
 
 const aiTeam = ref([
@@ -273,24 +278,7 @@ const myProjects = ref([
 
 <template>
   <div class="dashboard">
-    <header class="header">
-      <div class="header-content">
-        <div class="logo">
-          <span class="logo-icon">⚛</span>
-          <span class="logo-text">Atoms</span>
-        </div>
-        <nav class="nav">
-          <button 
-            v-for="item in navItems" 
-            :key="item.name"
-            :class="['nav-item', { active: activeTab === item.name }]"
-            @click="activeTab = item.name"
-          >
-            {{ item.label }}
-          </button>
-        </nav>
-      </div>
-    </header>
+    <SiteHeader />
 
     <main class="main">
       <template v-if="activeTab === 'discover'">
@@ -308,6 +296,14 @@ const myProjects = ref([
                 rows="3"
                 @keydown.enter="handleEnter"
               ></textarea>
+
+              <div v-if="pendingFiles.length" class="pending-attachments">
+                <div v-for="(item, index) in pendingFiles" :key="`${item.path}-${item.file.lastModified}`" class="pending-attachment">
+                  <span>📄</span>
+                  <span class="pending-attachment-name" :title="item.path">{{ item.path }}</span>
+                  <button type="button" class="pending-attachment-remove" :aria-label="`移除 ${item.path}`" @click="removePendingFile(index)">×</button>
+                </div>
+              </div>
 
               <div class="input-toolbar">
                 <div class="toolbar-left">
@@ -481,8 +477,9 @@ const myProjects = ref([
 
 <style scoped>
 .dashboard {
-  background: #f5f5f5;
+  background: #f6f7fb;
   width: 100%;
+  min-height: 100vh;
 }
 
 .header {
@@ -564,9 +561,10 @@ const myProjects = ref([
 
 .main {
   width: 100%;
-  padding: 100px 3vw 3vw;
+  padding: 36px 3vw 3vw;
   box-sizing: border-box;
-  background: #f5f5f5;
+  background: #f6f7fb;
+  min-height: calc(100vh - 64px);
 }
 
 .hero {
@@ -1089,7 +1087,7 @@ const myProjects = ref([
   align-items: center;
   padding: 60px 20px;
   box-sizing: border-box;
-  background: #f5f5f5;
+  background: transparent;
 }
 
 .hero-section {
@@ -1140,6 +1138,51 @@ const myProjects = ref([
 
 .main-input::placeholder {
   color: #999;
+}
+
+.pending-attachments {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 12px;
+}
+
+.pending-attachment {
+  max-width: 250px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 8px;
+  border: 1px solid #dbe3f0;
+  border-radius: 9px;
+  background: #f8fafc;
+  color: #475569;
+  font-size: 12px;
+  flex: 0 0 auto;
+}
+
+.pending-attachment-name {
+  max-width: 184px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pending-attachment-remove {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: #e2e8f0;
+  color: #64748b;
+  cursor: pointer;
+  line-height: 20px;
+}
+
+.pending-attachment-remove:hover {
+  background: #fecaca;
+  color: #b91c1c;
 }
 
 .input-toolbar {

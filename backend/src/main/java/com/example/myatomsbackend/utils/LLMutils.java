@@ -23,7 +23,8 @@ public class LLMutils {
         this.chatCompletionsUrl = stripTrailingSlash(baseUrl) + "/v1/chat/completions";
         this.client = new OkHttpClient.Builder()
                 .connectTimeout(60, TimeUnit.SECONDS)
-                .readTimeout(120, TimeUnit.SECONDS)
+                // OkHttp readTimeout 是相邻数据包的空闲超时，不是整次响应时长。
+                .readTimeout(180, TimeUnit.SECONDS)
                 .writeTimeout(60, TimeUnit.SECONDS)
                 .build();
     }
@@ -51,7 +52,22 @@ public class LLMutils {
                 .post(RequestBody.create(requestJson, JSON))
                 .build();
 
-        return new LLMStreamResponse(client.newCall(request).execute());
+        Response response = client.newCall(request).execute();
+        for (int attempt = 1; attempt <= 2 && isRetryable(response.code()); attempt++) {
+            response.close();
+            try {
+                Thread.sleep(500L * attempt);
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                throw new IOException("等待重试时被中断", exception);
+            }
+            response = client.newCall(request).execute();
+        }
+        return new LLMStreamResponse(response);
+    }
+
+    private static boolean isRetryable(int statusCode) {
+        return statusCode == 429 || statusCode == 503 || statusCode == 504;
     }
 
     private static String stripTrailingSlash(String value) {

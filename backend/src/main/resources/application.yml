@@ -2,11 +2,16 @@ server:
   port: 8080
 
 spring:
+  config:
+    import: optional:file:.env[.properties]
   mvc:
     async:
-      request-timeout: 5m
+      request-timeout: 15m
 
 llm:
   base-url: https://api.siliconflow.cn
   model: Pro/zai-org/GLM-5.1
-  api-key: sk-jtvnlfxfuzitpiiencfshxjnzbvhtcuyqcxnyungrrcyjdqm
+  api-key: ${SILICONFLOW_API_KEY:}
+
+search:
+  tavily-api-key: ${TAVILY_API_KEY:}
